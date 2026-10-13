@@ -423,6 +423,40 @@ def selftest():
     assert len(clip("OpenLinkHub: " + "z" * 5000, MAX_ERROR)) == MAX_ERROR + 1
     assert clip("short", MAX_ERROR) == "short"
 
+    # The panel meets the same foreign strings as the CLI does. Values pass
+    # through plain() as they enter, so markup cannot reach the tooltip or
+    # PanelHero either (both live in Omarchy's shell, where this plugin cannot
+    # set textFormat), and every Text block that renders a bridge field asks for
+    # plain text on top of that. A raw assignment here would put the hole back.
+    panel = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Panel.qml")
+    qml = open(panel, encoding="utf-8").read()
+    assert "function plain(value, fallback)" in qml, "Panel.qml lost plain()"
+    for field in ("d.product", "d.firmware", "d.effect", "d.effect_name"):
+        assert "root.plain(" + field in qml, "%s reaches the panel unclipped" % field
+    assert "root.plain(p && p.name)" in qml, "profile names reach the panel unclipped"
+
+    rader = qml.splitlines()
+    for i, rad in enumerate(rader):
+        if not rad.strip().startswith("text:"):
+            continue
+        if not re.search(r"root\.(product|firmware|effectName)|modelData\.name", rad):
+            continue
+        # The flag may sit above or below the text: line, so the block is found
+        # from its opening "Text {" and read down to its closing brace.
+        start = i
+        while start > 0 and rader[start].strip() != "Text {":
+            start -= 1
+        if rader[start].strip() != "Text {":
+            continue
+        indrag = len(rader[start]) - len(rader[start].lstrip())
+        block, k = [], start + 1
+        while k < len(rader) and (rader[k].strip() == ""
+                                 or (len(rader[k]) - len(rader[k].lstrip())) > indrag):
+            block.append(rader[k])
+            k += 1
+        assert any("textFormat: Text.PlainText" in r for r in block), \
+            "Panel.qml:%d renders a bridge field without Text.PlainText" % (i + 1)
+
     # The theme file is user-editable and outside this program's control, so the
     # parser is checked against what Omarchy's own themes write and against the
     # shapes that must be refused rather than guessed at.

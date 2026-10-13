@@ -66,6 +66,17 @@ Panel {
     Quickshell.execDetached(["xdg-open", "http://127.0.0.1:27003/index.html"])
   }
 
+  // Everything the bridge says arrives as a string, and a string can be markup:
+  // the panel's own Text blocks ask for plain text, but the tooltip and
+  // PanelHero live in Omarchy's shell, where this plugin cannot set textFormat.
+  // Markup characters are therefore dropped as the values enter, before any of
+  // them is rendered anywhere.
+  function plain(value, fallback) {
+    var s = (value === undefined || value === null) ? "" : String(value)
+    s = s.replace(/[<>&]/g, "").slice(0, 64)
+    return s !== "" ? s : (fallback === undefined ? "" : fallback)
+  }
+
   Process {
     id: pollProc
     command: ["python3", root.scriptPath, "status"]
@@ -82,11 +93,13 @@ Panel {
           }
           var d = JSON.parse(text.trim())
           root.connected = d.connected === true
-          root.product = d.product || root.product
-          root.firmware = d.firmware || ""
-          root.effect = d.effect || ""
-          root.effectName = d.effect_name || d.effect || ""
-          root.profiles = Array.isArray(d.profiles) ? d.profiles.slice(0, 64) : []
+          root.product = root.plain(d.product, root.product)
+          root.firmware = root.plain(d.firmware)
+          root.effect = root.plain(d.effect)
+          root.effectName = root.plain(d.effect_name) || root.plain(d.effect)
+          root.profiles = Array.isArray(d.profiles) ? d.profiles.slice(0, 64).map(function (p) {
+            return { id: root.plain(p && p.id), name: root.plain(p && p.name) }
+          }) : []
           root.currentColor = d.color || ""
           root.brightnessLevel = (typeof d.brightness === "number") ? d.brightness : -1
           root.themeColor = d.theme_color || ""
@@ -332,6 +345,7 @@ Panel {
               Item { Layout.fillWidth: true; height: 1 }
               Text {
                 text: root.effectName || "—"
+                textFormat: Text.PlainText
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.caption
                 color: Color.accent
