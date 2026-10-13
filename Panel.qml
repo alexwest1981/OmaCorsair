@@ -73,13 +73,20 @@ Panel {
       waitForEnd: true
       onStreamFinished: {
         try {
+          // The poll is fed by a CLI that reads an open local port; a status
+          // answer is bounded here as well, so a bridge that answers wrong
+          // cannot decide how much the shell holds on to.
+          if (text.length > 131072) {
+            console.warn("Keyglow: status output is too long, ignored")
+            return
+          }
           var d = JSON.parse(text.trim())
           root.connected = d.connected === true
           root.product = d.product || root.product
           root.firmware = d.firmware || ""
           root.effect = d.effect || ""
           root.effectName = d.effect_name || d.effect || ""
-          root.profiles = Array.isArray(d.profiles) ? d.profiles : []
+          root.profiles = Array.isArray(d.profiles) ? d.profiles.slice(0, 64) : []
           root.currentColor = d.color || ""
           root.brightnessLevel = (typeof d.brightness === "number") ? d.brightness : -1
           root.themeColor = d.theme_color || ""

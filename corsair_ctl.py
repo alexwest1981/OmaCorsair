@@ -51,6 +51,28 @@ STATE_PATH = os.path.join(
 NOT_A_KEYBOARD_EFFECT = {"keyboard", "mouse", "stand", "mousepad", "headset", "custom"}
 
 
+# The bridge answers on an unprivileged, unauthenticated port: with OpenLinkHub
+# stopped anyone local can bind 27003 and decide what it says. The shell parses
+# what this program prints, so the size of the answer is bounded here — never by
+# whoever happens to be answering.
+MAX_BYTES = 64 * 1024   # one HTTP body
+MAX_PROFILES = 64       # profile entries in status()
+MAX_TEXT = 64           # characters in a single string that leaves via status()
+
+
+def bounded(data, limit=MAX_BYTES, what="the response"):
+    """An answer over the limit is refused, not passed on."""
+    if len(data) > limit:
+        raise ValueError("%s answered %d bytes, over the %d byte cap" % (what, len(data), limit))
+    return data
+
+
+def clip(value):
+    """A foreign string does not get to decide how much the panel holds."""
+    text = str(value)
+    return text if len(text) <= MAX_TEXT else text[:MAX_TEXT] + "…"
+
+
 def http(path, payload=None, method="GET"):
     data = json.dumps(payload).encode() if payload is not None else None
     req = urllib.request.Request(
@@ -58,7 +80,7 @@ def http(path, payload=None, method="GET"):
         headers={"Content-Type": "application/json"},
     )
     with urllib.request.urlopen(req, timeout=6) as resp:
-        return resp.read().decode("utf-8", "replace")
+        return bounded(resp.read(MAX_BYTES + 1), what=path).decode("utf-8", "replace")
 
 
 LAST_ACTION = os.path.join(os.path.dirname(STATE_PATH), "last-action.json")
@@ -329,8 +351,8 @@ def status():
         out["error"] = "OpenLinkHub unreachable: %s" % exc
         return out
     out["connected"] = serial is not None
-    out["product"] = product
-    out["serial"] = serial or ""
+    out["product"] = clip(product)
+    out["serial"] = clip(serial or "")
     if not serial:
         return out
 
@@ -340,8 +362,8 @@ def status():
         return out
 
     out["profiles"] = [
-        {"id": pid, "name": prof.get("profileName") or pid}
-        for pid, prof in sorted(colors.get("profiles", {}).items())
+        {"id": clip(pid), "name": clip(prof.get("profileName") or pid)}
+        for pid, prof in sorted(colors.get("profiles", {}).items())[:MAX_PROFILES]
         if pid not in NOT_A_KEYBOARD_EFFECT
     ]
 
@@ -349,12 +371,12 @@ def status():
     # scalars are wanted, and a regex survives the raw bytes in that payload.
     try:
         raw = http("/api/devices/%s" % serial)
-        out["firmware"] = (re.search(r'"firmware":"([^"]*)"', raw) or [None, ""])[1]
+        out["firmware"] = clip((re.search(r'"firmware":"([^"]*)"', raw) or [None, ""])[1])
         if '"Brightness"' in raw:
             out["reported_brightness"] = int(re.search(r'"Brightness":(\d+)', raw).group(1))
         record = (re.search(r'"RGBProfile":"([^"]*)"', raw) or [None, ""])[1]
         if record and not state.get("effect"):
-            out["effect"] = record
+            out["effect"] = clip(record)
         for entry in out["profiles"]:
             if entry["id"] == out["effect"]:
                 out["effect_name"] = entry["name"]
@@ -370,6 +392,20 @@ def selftest():
     assert hex_to_rgb("f80") == [255, 136, 0]
     assert rgb_to_hex({"red": 255, "green": 136, "blue": 0}) == "#ff8800"
     assert clamp_speed(0) == 1 and clamp_speed(99) == 10 and clamp_speed(None) == 1
+
+    # The bridge's answer is not trusted: port 27003 is unprivileged and open to
+    # anyone local, so a body over the cap is refused and a foreign string is
+    # clipped before it can reach the panel.
+    assert bounded(b"x" * MAX_BYTES) == b"x" * MAX_BYTES
+    try:
+        bounded(b"x" * (MAX_BYTES + 1))
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("a body over the cap must be refused")
+    clipped = clip("k" * (MAX_TEXT + 5))
+    assert clipped.endswith("…") and len(clipped) == MAX_TEXT + 1
+    assert clip("short") == "short"
 
     # The theme file is user-editable and outside this program's control, so the
     # parser is checked against what Omarchy's own themes write and against the
@@ -451,7 +487,14 @@ def main(argv):
         print(json.dumps(status()))
         return
 
-    serial, _ = find_serial()
+    # A bridge that is down, silent or answering with something hostile gives a
+    # line here, not a traceback — `theme off` has to work without OpenLinkHub.
+    try:
+        serial, _ = find_serial()
+    except (urllib.error.URLError, ValueError, KeyError) as exc:
+        if not (cmd == "theme" and args and args[0].lower() in ("off", "av")):
+            fail("OpenLinkHub: %s" % exc)
+        serial = None
     # `theme off` is a state flag, not a keyboard action: it must work with the
     # keyboard unplugged (or OpenLinkHub down) so following can always be stopped.
     theme_off = cmd == "theme" and bool(args) and args[0].lower() in ("off", "av")
