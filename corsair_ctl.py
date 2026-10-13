@@ -31,13 +31,14 @@ import tomllib
 
 sys.dont_write_bytecode = True  # a .pyc here makes the shell reload the widget
 
+from http.client import BadStatusLine, HTTPException
+
 import contextlib
 import io
 import json
 import os
 import re
 import time
-import urllib.error
 import urllib.request
 
 BASE = os.environ.get("CORSAIR_API", "http://127.0.0.1:27003")
@@ -58,6 +59,13 @@ NOT_A_KEYBOARD_EFFECT = {"keyboard", "mouse", "stand", "mousepad", "headset", "c
 MAX_BYTES = 64 * 1024   # one HTTP body
 MAX_PROFILES = 64       # profile entries in status()
 MAX_TEXT = 64           # characters in a single string that leaves via status()
+MAX_ERROR = 200         # characters in a message that quotes a foreign answer
+
+# What a responder on that port can make this program raise. OSError covers urllib's
+# URLError; HTTPException is a responder that is not HTTP at all - a bogus status line
+# is carried in the exception's own message, so it is caught and clipped like any other
+# foreign text instead of reaching the shell as a traceback.
+BRIDGE_ERRORS = (OSError, ValueError, KeyError, HTTPException)
 
 
 def bounded(data, limit=MAX_BYTES, what="the response"):
@@ -67,10 +75,10 @@ def bounded(data, limit=MAX_BYTES, what="the response"):
     return data
 
 
-def clip(value):
+def clip(value, limit=MAX_TEXT):
     """A foreign string does not get to decide how much the panel holds."""
     text = str(value)
-    return text if len(text) <= MAX_TEXT else text[:MAX_TEXT] + "…"
+    return text if len(text) <= limit else text[:limit] + "…"
 
 
 def http(path, payload=None, method="GET"):
@@ -194,7 +202,7 @@ def find_serial():
 
 
 def fail(message):
-    print(json.dumps({"ok": False, "error": message}))
+    print(json.dumps({"ok": False, "error": clip(message, MAX_ERROR)}))
     raise SystemExit(0)
 
 
@@ -347,8 +355,8 @@ def status():
     }
     try:
         serial, product = find_serial()
-    except (urllib.error.URLError, ValueError, KeyError) as exc:
-        out["error"] = "OpenLinkHub unreachable: %s" % exc
+    except BRIDGE_ERRORS as exc:
+        out["error"] = clip("OpenLinkHub unreachable: %s" % exc, MAX_ERROR)
         return out
     out["connected"] = serial is not None
     out["product"] = clip(product)
@@ -358,7 +366,7 @@ def status():
 
     try:
         colors = json.loads(http("/api/color/%s" % serial))["data"]
-    except (urllib.error.URLError, ValueError, KeyError):
+    except BRIDGE_ERRORS:
         return out
 
     out["profiles"] = [
@@ -380,7 +388,7 @@ def status():
         for entry in out["profiles"]:
             if entry["id"] == out["effect"]:
                 out["effect_name"] = entry["name"]
-    except (urllib.error.URLError, ValueError, AttributeError):
+    except BRIDGE_ERRORS + (AttributeError,):
         pass
 
     return out
@@ -406,6 +414,14 @@ def selftest():
     clipped = clip("k" * (MAX_TEXT + 5))
     assert clipped.endswith("…") and len(clipped) == MAX_TEXT + 1
     assert clip("short") == "short"
+
+    # A responder that is not HTTP at all must give a line, not a traceback: the bogus
+    # status line travels inside the exception's own message (measured: 42 358 bytes of
+    # stderr for a 40 000-character line before this was caught), so it is clipped like
+    # any other foreign text.
+    assert issubclass(BadStatusLine, BRIDGE_ERRORS), "a non-HTTP answer must be caught"
+    assert len(clip("OpenLinkHub: " + "z" * 5000, MAX_ERROR)) == MAX_ERROR + 1
+    assert clip("short", MAX_ERROR) == "short"
 
     # The theme file is user-editable and outside this program's control, so the
     # parser is checked against what Omarchy's own themes write and against the
@@ -491,7 +507,7 @@ def main(argv):
     # line here, not a traceback — `theme off` has to work without OpenLinkHub.
     try:
         serial, _ = find_serial()
-    except (urllib.error.URLError, ValueError, KeyError) as exc:
+    except BRIDGE_ERRORS as exc:
         if not (cmd == "theme" and args and args[0].lower() in ("off", "av")):
             fail("OpenLinkHub: %s" % exc)
         serial = None
@@ -514,7 +530,7 @@ def main(argv):
             set_effect(serial, "off")
         else:
             fail("unknown command: %s" % cmd)
-    except (urllib.error.URLError, ValueError, KeyError, RuntimeError) as exc:
+    except BRIDGE_ERRORS + (RuntimeError,) as exc:
         fail("%s: %s" % (cmd, exc))
     finally:
         record_action(cmd, args)
