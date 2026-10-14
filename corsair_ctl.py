@@ -81,13 +81,35 @@ def clip(value, limit=MAX_TEXT):
     return text if len(text) <= limit else text[:limit] + "…"
 
 
+class RefuseRedirects(urllib.request.HTTPRedirectHandler):
+    """The bridge never redirects, so a 30x is an impostor (or a mistake).
+
+    urllib's own handler follows the redirect AND reads its body first: http_error_302
+    calls fp.read() with no limit (CPython's implementation, still true in 3.14), so the
+    bounded read below never gets a chance and a 302 with a streamed oversized body is
+    buffered in full. Measured before this class existed: with a 256 MB address-space
+    limit the status call died of MemoryError in 0.27 s after the responder had pushed
+    133 MB, against a 64 KiB cap. Returning None hands the answer to urllib's default
+    error handler, which raises HTTPError for the status line without touching the body
+    — caught like every other bridge error, since HTTPError is an OSError.
+    """
+
+    def http_error_302(self, req, fp, code, msg, headers):
+        return None
+
+    http_error_301 = http_error_303 = http_error_307 = http_error_308 = http_error_302
+
+
+BRIDGE_OPENER = urllib.request.build_opener(RefuseRedirects())
+
+
 def http(path, payload=None, method="GET"):
     data = json.dumps(payload).encode() if payload is not None else None
     req = urllib.request.Request(
         BASE + path, data=data, method=method,
         headers={"Content-Type": "application/json"},
     )
-    with urllib.request.urlopen(req, timeout=6) as resp:
+    with BRIDGE_OPENER.open(req, timeout=6) as resp:
         return bounded(resp.read(MAX_BYTES + 1), what=path).decode("utf-8", "replace")
 
 
@@ -521,6 +543,62 @@ def selftest():
         raise AssertionError("a bad colour must not pass")
     except SystemExit:
         pass
+
+    # A 30x is refused before its body is read. urllib's own redirect handler reads the
+    # redirect's body inside http_error_302 (fp.read(), no limit), so the 64 KiB cap below
+    # never sees the answer at all: measured before RefuseRedirects, a 302 whose body
+    # streamed put 133 MB in the process in 0.27 s under a 256 MB address-space limit, and
+    # the call died of MemoryError. The responder here answers 302 and streams; the check
+    # asserts the refusal AND that it got almost nothing out of the door.
+    import socket as _socket
+    import threading as _threading
+    _STOR = 8 * 1024 * 1024
+    _srv = _socket.socket()
+    _srv.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
+    _srv.bind(("127.0.0.1", 0))
+    _srv.listen(1)
+    _port = _srv.getsockname()[1]
+    _skickat = []
+
+    def _betjäna():
+        try:
+            _anslutning, _ = _srv.accept()
+        except OSError:
+            return
+        with _anslutning:
+            _anslutning.settimeout(10)
+            try:
+                _anslutning.recv(65536)
+            except OSError:
+                pass
+            try:
+                _anslutning.sendall(
+                    ("HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:%d/next\r\n"
+                     "Content-Length: %d\r\nConnection: close\r\n\r\n"
+                     % (_port, _STOR)).encode())
+                while sum(_skickat) < _STOR:
+                    _anslutning.sendall(b"A" * 65536)
+                    _skickat.append(65536)
+            except OSError:
+                pass                      # the client closed — that is what is measured
+
+    _tråd = _threading.Thread(target=_betjäna, daemon=True)
+    _tråd.start()
+    _sparad = globals()["BASE"]
+    globals()["BASE"] = "http://127.0.0.1:%d" % _port
+    try:
+        try:
+            http("/status")
+            raise AssertionError("a 302 must be refused")
+        except BRIDGE_ERRORS as _exc:
+            _fel = str(_exc)
+    finally:
+        globals()["BASE"] = _sparad
+        _srv.close()
+    _tråd.join(timeout=5)
+    assert "302" in _fel, _fel
+    assert sum(_skickat) < 4 * 1024 * 1024, \
+        "the redirect's body was read: %d bytes" % sum(_skickat)
     print(json.dumps({"ok": True, "selftest": "passed"}))
 
 
